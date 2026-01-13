@@ -1,0 +1,4 @@
+[submodule "configs"]
+	path = configs
+	url = https://github.com/AXSOL-AXOS/AXOS_Configs.git
+	branch = main
