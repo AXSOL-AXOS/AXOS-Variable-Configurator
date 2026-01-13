@@ -1,0 +1,9 @@
+.idea/
+__pycache__/
+*.pyc
+.venv/
+venv/
+out/
+out_all/
+.streamlit/
+ui_backups/
