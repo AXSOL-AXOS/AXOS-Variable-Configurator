@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
-import shutil
 
+import git
 import pandas as pd
 import streamlit as st
+from git import Repo, InvalidGitRepositoryError
 
 from axos_var_configurator.baseline import apply_baseline, plan_baseline
-from axos_var_configurator.csvio import detect_csv_kind, load_axsol_abstractions_by_prefix, read_csv_rows
+from axos_var_configurator.config import DEFAULT_CONFIGS_PATH, DATABASE_DEVICES_PATH
+from axos_var_configurator.csvio import (
+    detect_csv_kind,
+    load_axsol_abstractions_by_prefix,
+    read_csv_rows,
+    scan_database
+)
 from axos_var_configurator.exporter import export_device_json
-from axos_var_configurator.csvio import scan_database
 
 
 DEFAULT_DB_PATH = Path(
@@ -114,7 +123,7 @@ def main() -> None:
         st.error("Database folder does not exist")
         return
 
-    tab_edit, tab_export, tab_baseline = st.tabs(["Edit CSV", "Export JSON", "Baselines"])
+    tab_edit, tab_create_json, tab_baseline, tab_git = st.tabs(["Edit CSV", "Create JSON", "Baselines", "Git"])
 
     with tab_edit:
         st.subheader("Edit CSV")
@@ -178,32 +187,133 @@ def main() -> None:
                 st.success(f"Saved. Backup created at: {backup_path}")
                 st.session_state["_original_df"] = edited_df.copy()
 
-    with tab_export:
-        st.subheader("Export JSON")
-
+    with tab_create_json:
+        st.subheader("Create JSON Files")
+        
+        # Scan for device files
         scan = scan_database(db_path)
         device_files = scan.device_files
-
-        export_all = st.checkbox("Export all devices", value=True)
-        mode = st.selectbox("Mode", options=["both", "original", "axsol"], index=0)
-        out_dir = st.text_input("Output folder", value=str((Path.cwd() / "out_all").resolve()))
-
+        
+        # File selection
+        col1, col2 = st.columns(2)
+        with col1:
+            export_all = st.checkbox("Export all devices", value=True)
+            mode = st.selectbox("Export mode", options=["both", "original", "axsol"], index=0)
+        
         if export_all:
             selection = device_files
         else:
-            selection = st.multiselect("Select device CSVs", options=device_files, format_func=lambda p: p.name)
-
-        if st.button("Run export", type="primary"):
-            abstractions = load_axsol_abstractions_by_prefix(db_path)
-            out = Path(out_dir).expanduser().resolve()
-            out.mkdir(parents=True, exist_ok=True)
-
-            modes = [mode] if mode != "both" else ["original", "axsol"]
-            for device_csv in selection:
-                device_folder = out / _sanitize_folder(device_csv.stem)
-                for m in modes:
-                    export_device_json(device_csv=device_csv, out_dir=device_folder / m, mode=m, abstractions=abstractions)
-            st.success(f"Exported {len(selection)} device(s) to {out}")
+            selection = st.multiselect("Select device CSVs to export", 
+                                     options=device_files, 
+                                     format_func=lambda p: p.name)
+        
+        # Output options
+        st.subheader("Export Options")
+        out_dir = st.text_input("Output folder", value=str((Path.cwd() / "out_all").resolve()))
+        
+        # Git options
+        st.subheader("Git Options")
+        use_git = st.checkbox("Use Git for version control", value=True)
+        
+        git_commit_msg = ""
+        if use_git:
+            git_commit_msg = st.text_area("Commit message", 
+                                        value="Update device configurations",
+                                        help="Enter a descriptive commit message")
+        
+        # Action buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Export to Folder", type="primary"):
+                if not selection:
+                    st.warning("Please select at least one device to export")
+                else:
+                    with st.spinner("Exporting JSON files..."):
+                        try:
+                            out_path = Path(out_dir)
+                            out_path.mkdir(parents=True, exist_ok=True)
+                            
+                            abstractions = load_axsol_abstractions_by_prefix(db_path)
+                            
+                            for device_file in selection:
+                                try:
+                                    # Create a subdirectory for each device based on the CSV filename
+                                    device_name = device_file.stem
+                                    device_out_dir = out_path / device_name
+                                    
+                                    # For 'both' mode, create 'original' and 'axsol' subdirectories
+                                    modes = [mode] if mode != "both" else ["original", "axsol"]
+                                    
+                                    for mode_dir in modes:
+                                        mode_out_dir = device_out_dir / mode_dir if mode != "both" else device_out_dir
+                                        mode_out_dir.mkdir(parents=True, exist_ok=True)
+                                        
+                                        export_device_json(
+                                            device_file,
+                                            abstractions=abstractions,
+                                            mode=mode_dir if mode == "both" else mode,
+                                            out_dir=mode_out_dir
+                                        )
+                                    
+                                except Exception as e:
+                                    st.error(f"Error exporting {device_file.name}: {str(e)}")
+                            
+                            st.success(f"Successfully exported {len(selection)} device(s) to {out_path}")
+                            
+                        except Exception as e:
+                            st.error(f"Export failed: {str(e)}")
+        
+        with col2:
+            if use_git and st.button("Commit to Git", type="secondary"):
+                if not selection:
+                    st.warning("Please select at least one device to commit")
+                elif not git_commit_msg.strip():
+                    st.warning("Please enter a commit message")
+                else:
+                    try:
+                        import git
+                        from axos_var_configurator.gitutil import git_add, git_commit, git_push
+                        
+                        # Get the repository
+                        repo_path = DATABASE_DEVICES_PATH.parent  # Assuming DATABASE_DEVICES_PATH is in the repo
+                        repo = git.Repo(repo_path)
+                        
+                        # Only add files that are within the repository
+                        files_to_commit = []
+                        for device_file in selection:
+                            try:
+                                # Check if file is in the repository
+                                rel_path = device_file.relative_to(repo_path)
+                                files_to_commit.append(device_file)
+                            except ValueError:
+                                st.warning(f"File {device_file} is not in the Git repository and will not be committed")
+                                continue
+                        
+                        if not files_to_commit:
+                            st.error("No files to commit - all selected files are outside the repository")
+                            return
+                            
+                        # Add and commit each file
+                        for device_file in files_to_commit:
+                            # Get relative path from repo root
+                            rel_path = device_file.relative_to(repo_path)
+                            git_add(repo, str(rel_path))
+                        
+                        # Commit changes
+                        commit_hash = git_commit(repo, git_commit_msg)
+                        st.success(f"Successfully committed changes with hash: {commit_hash}")
+                        
+                        # Option to push
+                        if st.button("Push to Remote"):
+                            try:
+                                git_push(repo)
+                                st.success("Successfully pushed changes to remote repository")
+                            except Exception as e:
+                                st.error(f"Failed to push to remote: {str(e)}")
+                        
+                    except Exception as e:
+                        st.error(f"Git operation failed: {str(e)}")
+                        st.exception(e)  # Show full traceback for debugging
 
     with tab_baseline:
         st.subheader("Baselines")
@@ -230,6 +340,379 @@ def main() -> None:
         if st.button("Create baseline", type="primary", disabled=not confirm_baseline):
             out = apply_baseline(plan)
             st.success(f"Created baseline at {out}")
+
+    with tab_git:
+        st.subheader("Create and Push to Git")
+        st.info("This section helps you commit and push your configuration changes to Git.")
+        
+        # Show current config directory
+        config_dir = DATABASE_DEVICES_PATH.parent
+        st.write(f"**Configuration directory:** `{config_dir}`")
+        
+        # Initialize git repo if not already
+        repo = None
+        try:
+            repo = git.Repo(str(config_dir), search_parent_directories=True)
+            repo_root = Path(repo.working_tree_dir).resolve()
+            st.success(f"✅ Found Git repository at `{repo_root}`")
+            
+            try:
+                scope_rel = config_dir.resolve().relative_to(repo_root)
+                st.write(f"**Working in folder:** `{scope_rel}`")
+                
+                # Show current branch
+                if repo.head.is_detached:
+                    st.warning("⚠️ You are in 'detached HEAD' state. Please checkout a branch.")
+                else:
+                    st.write(f"**Current branch:** `{repo.active_branch.name}`")
+                
+                # Show remote information
+                if not repo.remotes:
+                    st.warning("⚠️ No remote repositories configured.")
+                else:
+                    st.write("**Remotes:**")
+                    for remote in repo.remotes:
+                        st.write(f"- {remote.name}: {remote.url}")
+                
+                # Show status
+                st.subheader("Current Changes")
+                changed_files = [item.a_path for item in repo.index.diff(None)] + repo.untracked_files
+                
+                if not changed_files:
+                    st.success("✅ No uncommitted changes.")
+                else:
+                    st.warning(f"⚠️ Found {len(changed_files)} uncommitted changes:")
+                    for file in changed_files:
+                        st.write(f"- {file}")
+                    
+                    # Commit section
+                    with st.form("commit_form"):
+                        st.subheader("Commit Changes")
+                        commit_message = st.text_area(
+                            "Commit message",
+                            value="Update configuration",
+                            help="Enter a descriptive message about the changes you're committing"
+                        )
+                        
+                        # Stage all changes by default
+                        stage_all = st.checkbox("Stage all changes", value=True)
+                        
+                        if st.form_submit_button("Create Commit"):
+                            try:
+                                with st.spinner("Creating commit..."):
+                                    if stage_all:
+                                        repo.git.add(all=True)
+                                    
+                                    # Create the commit
+                                    repo.index.commit(commit_message)
+                                    st.success(f"✅ Successfully created commit: {repo.head.commit.hexsha[:7]}")
+                                    st.session_state.last_commit = repo.head.commit.hexsha
+                                    
+                                    # Update the changed files list
+                                    changed_files = []
+                                    st.experimental_rerun()
+                                    
+                            except Exception as e:
+                                st.error(f"❌ Failed to create commit: {str(e)}")
+                
+                # Push section (only show if there are remotes)
+                if repo.remotes and 'last_commit' in st.session_state:
+                    st.subheader("Push to Remote")
+                    
+                    if st.button("Push Changes", type="primary"):
+                        try:
+                            with st.spinner("Pushing to remote..."):
+                                remote = repo.remotes[0]  # Use the first remote
+                                push_info = remote.push()[0]
+                                
+                                if push_info.flags & push_info.ERROR:
+                                    st.error(f"❌ Failed to push: {push_info.summary}")
+                                elif push_info.flags & push_info.UP_TO_DATE:
+                                    st.info("ℹ️ Everything up-to-date")
+                                else:
+                                    st.success(f"✅ Successfully pushed to {remote.name}/{repo.active_branch.name}")
+                                    
+                        except Exception as e:
+                            st.error(f"❌ Failed to push: {str(e)}")
+                            
+            except ValueError:
+                st.error(f"The config directory is not inside the detected Git repo. Repo root: `{repo_root}`")
+                repo = None
+                
+        except InvalidGitRepositoryError:
+            st.warning("No Git repository found in this folder or any parent folder.")
+            
+            
+            with st.expander("Initialize New Git Repository"):
+                st.write("Initialize a new Git repository to start tracking changes.")
+                repo_name = st.text_input("Repository name", value="AXOS_Configs")
+                
+                if st.button("Initialize Repository"):
+                    try:
+                        # Create the repository one level up from the config directory
+                        repo_path = config_dir.parent / repo_name
+                        repo_path.mkdir(exist_ok=True)
+                        
+                        # Initialize the repository
+                        repo = git.Repo.init(str(repo_path))
+                        
+                        # Move the config directory into the new repository
+                        new_config_dir = repo_path / config_dir.name
+                        if not new_config_dir.exists():
+                            config_dir.rename(new_config_dir)
+                        
+                        # Create a .gitignore file
+                        gitignore = repo_path / ".gitignore"
+                        gitignore.write_text("# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+out/
+*.csv
+*.json
+")
+                        
+                        # Add and commit initial files
+                        repo.git.add(all=True)
+                        repo.index.commit("Initial commit")
+                        
+                        st.success(f"✅ Successfully initialized Git repository at `{repo_path}`")
+                        st.info(f"Please refresh the page to continue with the new repository.")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Failed to initialize Git repository: {e}")
+        
+        except Exception as e:
+            st.error(f"❌ Error accessing Git repository: {e}")
+            st.exception(e)
+                    return
+                
+                try:
+                    # Get all files in the config directory
+                    all_files = set()
+                    for ext in ('*.csv', '*.json'):
+                        for f in config_path.rglob(ext):
+                            if f.is_file():
+                                rel_path = f.relative_to(config_path)
+                                all_files.add(str(rel_path).replace('\\', '/'))
+                    
+                    # Get tracked files using git ls-files
+                    ls_cmd = ['git', 'ls-files', '--full-name', '--', str(scope_rel)]
+                    ls_output = subprocess.check_output(ls_cmd, cwd=str(repo_path), text=True)
+                    tracked_files = set()
+                    for f in ls_output.splitlines():
+                        try:
+                            # Convert repo-relative path to config-relative path
+                            repo_rel_path = Path(f)
+                            if str(repo_rel_path).startswith(str(scope_rel)):
+                                config_rel_path = repo_rel_path.relative_to(scope_rel)
+                                tracked_files.add(str(config_rel_path).replace('\\', '/'))
+                        except ValueError:
+                            continue
+                    
+                    # Get git status for our scope
+                    status_cmd = ['git', 'status', '--porcelain', '--untracked-files=all', '--ignored=no', '--', str(scope_rel)]
+                    status_output = subprocess.check_output(status_cmd, cwd=str(repo_path), text=True)
+                    
+                    # Initialize sets for different statuses
+                    changed_files = set()
+                    untracked_files = set()
+                    
+                    # Parse the status output
+                    for line in status_output.split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                            
+                        # Parse the status line (format: XY filename)
+                        status_code = line[:2].strip()
+                        file_path_str = line[3:].strip()
+                        
+                        if not file_path_str:
+                            continue
+                            
+                        try:
+                            # Get the relative path within our config directory
+                            file_path = Path(file_path_str)
+                            if str(file_path).startswith(str(scope_rel)):
+                                rel_path = file_path.relative_to(scope_rel)
+                            else:
+                                rel_path = file_path
+                            
+                            rel_path_str = str(rel_path).replace('\\', '/')
+                            
+                            # Check if file is untracked
+                            if status_code == '??':
+                                untracked_files.add(rel_path_str)
+                            # Check if file is modified, added, or deleted
+                            elif any(x != ' ' for x in status_code):
+                                changed_files.add(rel_path_str)
+                                
+                        except Exception as e:
+                            st.warning(f"Could not process file path '{file_path_str}': {e}")
+                            continue
+                    
+                    # Calculate tracked but unmodified files
+                    tracked_unmodified = list(tracked_files - changed_files - untracked_files)
+                    changed_files = list(changed_files)
+                    untracked_files = list(untracked_files)
+                    
+                    # Sort all lists for consistent display
+                    changed_files.sort()
+                    untracked_files.sort()
+                    tracked_unmodified.sort()
+                    
+                    # Debug information
+                    with st.expander("Debug Details", expanded=False):
+                        st.write(f"Found {len(all_files)} files in config directory")
+                        st.write(f"Found {len(tracked_files)} tracked files")
+                        st.write(f"Found {len(changed_files)} changed files")
+                        st.write(f"Found {len(untracked_files)} untracked files")
+                        st.write(f"Found {len(tracked_unmodified)} tracked and unmodified files")
+                        
+                        st.write("<details><summary>Tracked Files</summary><pre>" + "\n".join(tracked_files) + "</pre></details>", 
+                                unsafe_allow_html=True)
+                        
+                except subprocess.CalledProcessError as e:
+                    st.error(f"Git command failed: {e}")
+                    st.error(f"Command: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}")
+                    st.error(f"Output: {e.output}")
+                    return
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    import traceback
+                    st.error(f"<pre>{traceback.format_exc()}</pre>", unsafe_allow_html=True)
+                    return
+                
+                # Display repository status
+                st.write("### Repository Status")
+                
+                # Show summary
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Modified", len(changed_files))
+                with col2:
+                    st.metric("Untracked", len(untracked_files))
+                with col3:
+                    st.metric("Tracked", len(tracked_unmodified))
+                
+                # Show detailed file status
+                if changed_files or untracked_files or tracked_unmodified:
+                    with st.expander("View File Status", expanded=True):
+                        if changed_files:
+                            st.write("**Modified Files**")
+                            for f in sorted(changed_files):
+                                st.code(f"M {f}", language="bash")
+                        
+                        if untracked_files:
+                            st.write("**Untracked Files**")
+                            for f in sorted(untracked_files):
+                                st.code(f"? {f}", language="bash")
+                        
+                        if tracked_unmodified:
+                            st.write("**Tracked Files**")
+                            # Show first 10 files with a "Show more" button if there are many
+                            show_all = st.toggle("Show all tracked files", value=False, key="show_all_tracked")
+                            files_to_show = tracked_unmodified if show_all else tracked_unmodified[:10]
+                            
+                            for f in sorted(files_to_show):
+                                st.code(f"  {f}", language="bash")
+                            
+                            if not show_all and len(tracked_unmodified) > 10:
+                                st.write(f"... and {len(tracked_unmodified) - 10} more tracked files")
+                    
+                    # Stage and commit
+                    st.subheader("Stage & Commit")
+                    commit_message = st.text_area(
+                        "Commit message", 
+                        value=f"Update configurations - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                        key="commit_message"
+                    )
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Stage All Changes"):
+                            try:
+                                # Get relative path from repo root to config dir
+                                scope_rel = config_dir.resolve().relative_to(repo_path.resolve())
+                                # Add all changes in the config directory
+                                repo.git.add("*", "--", str(scope_rel))
+                                st.success(f"Staged all changes in `{scope_rel}`")
+                                # Force a rerun to update the status
+                                st.experimental_rerun()
+                            except Exception as e:
+                                st.error(f"Failed to stage changes: {e}")
+                    
+                    with col2:
+                        if st.button("Commit Changes"):
+                            try:
+                                # Check if there are any staged changes
+                                staged_changes = repo.git.diff("--cached", "--name-status").strip()
+                                
+                                if not staged_changes:
+                                    st.warning("No staged changes to commit. Please stage your changes first.")
+                                elif not commit_message.strip():
+                                    st.error("Please enter a commit message")
+                                else:
+                                    # Commit the staged changes
+                                    repo.index.commit(commit_message)
+                                    st.success(f"Committed changes: {commit_message}")
+                                    # Force a rerun to update the status
+                                    st.experimental_rerun()
+                            except Exception as e:
+                                st.error(f"Failed to commit: {e}")
+                    
+                    # Push to remote
+                    st.subheader("Push to Remote")
+                    remote_name = st.text_input("Remote name", value="origin")
+                    branch_name = st.text_input("Branch name", value="main")
+                    
+                    if st.button("Push to Remote"):
+                        try:
+                            with st.spinner("Pushing to remote..."):
+                                # Check if remote exists, if not add it
+                                if remote_name not in [r.name for r in repo.remotes]:
+                                    repo.create_remote(remote_name, "https://github.com/AXSOL-AXOS/AXOS_Configs.git")
+                                
+                                # Push to remote
+                                repo.git.push("-u", remote_name, f"HEAD:{branch_name}")
+                                st.success(f"Successfully pushed to {remote_name}/{branch_name}")
+                        except Exception as e:
+                            st.error(f"Failed to push: {e}")
+                            st.exception(e)
+                else:
+                    st.info("No uncommitted changes in the repository.")
+                
+                # Branch information
+                st.subheader("Branch Information")
+                current_branch = repo.active_branch.name
+                st.write(f"Current branch: **{current_branch}**")
+                
+                # Remote tracking
+                try:
+                    remote = repo.remotes[0]
+                    st.write(f"Remote: {remote.name} - {next(remote.urls)}")
+                except (IndexError, StopIteration):
+                    st.warning("No remote repository configured")
+                
+            except Exception as e:
+                st.error(f"Error getting repository status: {e}")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+from rich.console import Console
+
+console = Console()
 
 
 @dataclass(frozen=True)
@@ -30,25 +33,45 @@ def read_csv_header(path: Path) -> list[str]:
 
 
 def detect_csv_kind(path: Path) -> str:
-    header = read_csv_header(path)
-
-    if not header:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            # Read the first line and split it into columns
+            first_line = next(f).strip()
+            # Clean up the header by removing any extra spaces and converting to lowercase
+            header = [h.strip().lower() for h in first_line.split(",") if h.strip()]
+            
+            # Debug output
+            print(f"Detected headers: {header}")
+            
+            # Check for device CSV
+            has_topic = "topic" in header
+            has_register = "register address" in header or "register adress" in header
+            
+            if has_topic and has_register:
+                print("Detected device CSV")
+                return "device"
+                
+            # Check for AXSOL abstraction CSV
+            has_axsol_short = "axsol_name_short" in header or any(h.startswith("unnamed:") for h in header)
+            has_axsol_name = "axsol name" in header
+            
+            if has_axsol_short and has_axsol_name:
+                print("Detected AXSOL abstraction CSV")
+                return "axsol_abstraction"
+                
+            # If we get here, we couldn't determine the type
+            print("Could not determine CSV type")
+            return "unknown"
+            
+    except Exception as e:
+        print(f"Error detecting CSV kind: {e}")
+        # Try to read the file to see what's in it
+        try:
+            with path.open("r", encoding="utf-8-sig") as f:
+                print(f"First 100 chars of file: {f.read(100)}")
+        except Exception as e2:
+            print(f"Could not read file: {e2}")
         return "unknown"
-
-    header_l = [h.lower() for h in header]
-
-    # Prefer device detection first: vendor CSVs can also contain "AXSOL Name" columns,
-    # and some exports include "Unnamed:" columns.
-    if "topic" in header_l and ("register address" in header_l or "register adress" in header_l):
-        return "device"
-
-    # AXSOL abstraction CSVs exist in multiple variants.
-    # Variant A: "AXSOL_Name_Short" + "AXSOL Name"
-    # Variant B: first column exported as "Unnamed: 0" + "AXSOL Name"
-    if ("axsol_name_short" in header_l or any(h.startswith("unnamed:") for h in header_l)) and "axsol name" in header_l:
-        return "axsol_abstraction"
-
-    return "unknown"
 
 
 def scan_database(db_path: Path) -> DatabaseScanResult:
@@ -88,19 +111,31 @@ def _axsol_name_keys(name: str) -> list[str]:
 
 def read_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None:
+        # Read all lines and clean them up
+        lines = [line.strip() for line in f if line.strip()]
+        if not lines:
             return ([], [])
-        fieldnames = list(reader.fieldnames)
+
+        # Read the header
+        header_line = lines[0]
+        # Use csv.reader to properly handle quoted fields in the header
+        header_reader = csv.reader([header_line])
+        fieldnames = [h.strip() for h in next(header_reader) if h.strip()]
+
+        # Create a CSV reader for the remaining lines
+        reader = csv.DictReader(lines[1:], fieldnames=fieldnames)
 
         rows: list[dict[str, str]] = []
-        for r in reader:
-            row: dict[str, str] = {}
-            for k, v in r.items():
+        for row in reader:
+            # Clean up the row data
+            cleaned_row = {}
+            for k, v in row.items():
                 if k is None:
                     continue
-                row[k] = "" if v is None else str(v)
-            rows.append(row)
+                clean_k = k.strip() if k else ""
+                clean_v = v.strip() if v is not None else ""
+                cleaned_row[clean_k] = clean_v
+            rows.append(cleaned_row)
 
     return (fieldnames, rows)
 
@@ -148,10 +183,48 @@ def load_axsol_abstractions_by_prefix(db_path: Path) -> dict[str, dict[str, AxsO
         if short_h is None or axsol_name_h is None:
             continue
 
-        unit_h = hmap.get("ax_unit") or hmap.get("axsol_unit_&_resolution")
-        scaling_h = hmap.get("ax_scaling")
-        lim_down_h = hmap.get("ax_limitdown")
-        lim_up_h = hmap.get("ax_limitup")
+        # For device CSVs, the column names are different from abstraction CSVs
+        # In device CSVs, we have direct column names like 'upperLimit' and 'lowerLimit'
+        unit_h = "AXSOL Unit & Resolution"
+        scaling_h = "Scaling"
+        lim_down_h = "lowerLimit"
+        lim_up_h = "upperLimit"
+        
+        # Debug output for column mapping
+        console.print(f"[dim]Using direct column mapping - Unit: {unit_h}, Scaling: {scaling_h}, Lower: {lim_down_h}, Upper: {lim_up_h}")
+        
+        # For abstraction CSVs, we need to try different variations
+        if not any(h in hmap for h in [unit_h, 'ax_unit', 'axsol_unit']):
+            # This is likely an abstraction CSV, use the old logic
+            unit_h = (
+                hmap.get("ax_unit") or 
+                hmap.get("axsol_unit_&_resolution") or
+                hmap.get("axsol unit & resolution") or
+                hmap.get("axsol_unit_and_resolution")
+            )
+            
+            scaling_h = hmap.get("ax_scaling") or hmap.get("ax_scaling_factor")
+            
+            # Try different variations of limit column names
+            lim_down_h = (
+                hmap.get("ax_limitdown") or 
+                hmap.get("ax_limit_down") or
+                hmap.get("lowerLimit") or
+                hmap.get("lower_limit") or
+                hmap.get("lower limit") or
+                "lowerLimit"  # Default fallback
+            )
+            
+            lim_up_h = (
+                hmap.get("ax_limitup") or 
+                hmap.get("ax_limit_up") or
+                hmap.get("upperLimit") or 
+                hmap.get("upper_limit") or
+                hmap.get("upper limit") or
+                "upperLimit"  # Default fallback
+            )
+            
+            console.print(f"[dim]Using abstraction mapping - Unit: {unit_h}, Scaling: {scaling_h}, Lower: {lim_down_h}, Upper: {lim_up_h}")
 
         for r in rows:
             long_val = (r.get(axsol_name_h) or "").strip()

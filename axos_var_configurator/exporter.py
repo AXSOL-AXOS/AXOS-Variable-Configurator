@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from rich.console import Console
 
 from axos_var_configurator.csvio import AxsOlAbstractionRow, read_csv_rows
 from rich.console import Console
@@ -27,23 +31,47 @@ def _write_json_file(file_path: Path, data: Dict[str, Any], force_overwrite: boo
     # Ensure parent directory exists
     file_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Write to a temporary file first, then rename atomically
-    temp_path = file_path.with_suffix('.tmp')
-    try:
-        temp_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-        # On Windows, we need to handle the case where the destination exists
-        if file_path.exists() and not force_overwrite:
-            file_path.unlink()
-        temp_path.rename(file_path)
-        console.print(f"[green]Wrote {file_path}")
-    except Exception as e:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
-        console.print(f"[red]Error writing {file_path}: {e}")
-        raise
+    # Create a temporary file with a unique name in the same directory
+    temp_path = file_path.parent / f".{file_path.name}.{os.getpid()}.tmp"
+    max_retries = 3
+    retry_delay = 0.1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Write to temporary file
+            temp_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            
+            # On Windows, we need to handle the case where the destination exists
+            if file_path.exists():
+                if not force_overwrite:
+                    raise FileExistsError(f"File {file_path} already exists and force_overwrite is False")
+                file_path.unlink()
+                
+            # Try to rename the temp file to the target file
+            temp_path.replace(file_path)
+            console.print(f"[green]Wrote {file_path}")
+            return
+            
+        except (OSError, IOError) as e:
+            if attempt == max_retries - 1:  # Last attempt
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                console.print(f"[red]Error writing {file_path} after {max_retries} attempts: {e}")
+                raise
+                
+            # Wait a bit before retrying
+            time.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+            
+        except Exception as e:
+            # Clean up temp file on any other error
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            console.print(f"[red]Error writing {file_path}: {e}")
+            raise
 
 
 def _needs_expansion(topic: Optional[str], multiplier: Optional[str]) -> tuple[bool, int]:
@@ -119,22 +147,20 @@ def _expand_name_template(template: Optional[str], idx: int) -> Optional[str]:
     if template is None:
         return None
     s = str(template)
-    return s.replace("#", str(idx))
+    # Format index with leading zero (01, 02, ..., 10, 11, ...)
+    idx_str = f"{idx:02d}"
+    # Simply replace any # with the index
+    return s.replace("#", idx_str)
 
 
 def _expand_mqtt_name(template: Optional[str], idx: int) -> Optional[str]:
     if template is None:
         return None
     s = str(template)
-
-    # AXSOL abstraction uses U#_... to mark unit values.
-    s = s.replace("U#_", f"U{idx}_")
-    s = s.replace("U_#_", f"U{idx}_")
-    s = s.replace("U_#", f"U{idx}")
-
-    # If someone used a generic # placeholder in mqttName, expand it too.
-    s = s.replace("#", str(idx))
-    return s
+    # Format index with leading zero (01, 02, ..., 10, 11, ...)
+    idx_str = f"{idx:02d}"
+    # Simply replace any # with the index
+    return s.replace("#", idx_str)
 
 
 def _parse_unit_and_scaling_blob(blob: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -170,11 +196,17 @@ def export_device_json(
     
     Args:
         device_csv: Path to the device CSV file
-        out_dir: Directory to write JSON files to
+        out_dir: Base directory to write JSON files to (will create 'original' or 'axsol' subdirectories)
         mode: Export mode ('axsol' or 'native')
         abstractions: AXSOL abstraction data
         force_overwrite: If True, existing files will be overwritten without confirmation
     """
+    # Create the appropriate subdirectory based on mode
+    if mode == 'axsol':
+        out_dir = out_dir / 'axsol'
+    else:
+        out_dir = out_dir / 'original'
+        
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fieldnames, rows = read_csv_rows(device_csv)
@@ -225,7 +257,10 @@ def export_device_json(
     # Check for existing files first
     existing_files = []
     for row in rows:
-        topic = row["Topic"]
+        topic = row.get("Topic", "")
+        if not topic:
+            continue
+            
         multiplier = row.get("Multiplier", "1")
         mqtt_name = row.get("MqttName", "")
         
@@ -284,11 +319,13 @@ def export_device_json(
         multiplier = get(r, "Multiplier")
         address_offset = get(r, "AddressOffset", "Address Offset")
 
-        mqtt_name: Optional[str] = None
-        ax_unit: Optional[str] = None
-        ax_scaling: Optional[str] = None
-        ax_lim_down: Optional[str] = None
-        ax_lim_up: Optional[str] = None
+        # Initialize with empty strings for MQTT name and description
+        mqtt_name = ""
+        ax_unit = None
+        ax_scaling = None
+        ax_lim_down = None
+        ax_lim_up = None
+        description = ""
 
         abs_row: Optional[AxsOlAbstractionRow] = None
 
@@ -300,7 +337,8 @@ def export_device_json(
                 if abs_row:
                     break
             if abs_row:
-                mqtt_name = abs_row.short_name
+                mqtt_name = abs_row.short_name or ""
+                description = abs_row.long_name or ""
                 ax_unit = abs_row.unit
                 ax_scaling = abs_row.scaling
                 ax_lim_down = abs_row.limit_down
@@ -309,8 +347,19 @@ def export_device_json(
         out_unit = unit
         out_scaling = scaling
         out_offset = offset
-        upper_limit = ax_lim_up if abs_row else None
-        lower_limit = ax_lim_down if abs_row else None
+        
+        # Get limit values from CSV first
+        csv_upper_limit = get(r, "upperLimit")
+        csv_lower_limit = get(r, "lowerLimit")
+        
+        # Use abstraction limits if available, otherwise fall back to CSV values
+        upper_limit = ax_lim_up or csv_upper_limit
+        lower_limit = ax_lim_down or csv_lower_limit
+        
+        # Debug output for limit values
+        console.print(f"[dim]Limits - CSV: ({csv_lower_limit}, {csv_upper_limit}), "
+                    f"Abstraction: ({ax_lim_down}, {ax_lim_up}), "
+                    f"Final: ({lower_limit}, {upper_limit})")
 
         if mode == "axsol" and axsol_long:
             if ax_unit:
@@ -327,16 +376,16 @@ def export_device_json(
                 out_scaling = ax_scaling
 
         payload = {
-            "mbRegister": reg,
-            "unit": out_unit,
-            "scaling": out_scaling,
-            "offset": out_offset,
-            "upperLimit": upper_limit,
-            "lowerLimit": lower_limit,
-            "description": axsol_long,
-            "mqttName": mqtt_name,
-            "type": dtype,
-            "nativeName": topic,
+            "mbRegister": reg or "",
+            "unit": out_unit or "",
+            "scaling": out_scaling or "",
+            "offset": out_offset or "",
+            "upperLimit": upper_limit or "",
+            "lowerLimit": lower_limit or "",
+            "description": description or axsol_long or "",
+            "mqttName": mqtt_name or "",
+            "type": dtype or "",
+            "nativeName": topic or "",
         }
 
         needs_expand, mult_i = _needs_expansion(topic, multiplier)
