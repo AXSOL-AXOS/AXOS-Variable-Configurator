@@ -36,13 +36,45 @@ def _write_json_file(file_path: Path, data: Dict[str, Any], force_overwrite: boo
     max_retries = 3
     retry_delay = 0.1  # seconds
     
+    # Custom JSON encoder to handle numeric formatting
+    class CustomJSONEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, (int, float)):
+                # Format with one decimal place and remove unnecessary decimal for integers
+                return float(f"{float(obj):.1f}")
+            return super().default(obj)
+    
     for attempt in range(max_retries):
         try:
-            # Write to temporary file
-            temp_path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8"
+            # Convert numeric strings to actual numbers
+            def convert_numbers(obj):
+                if isinstance(obj, dict):
+                    return {k: convert_numbers(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numbers(item) for item in obj]
+                elif isinstance(obj, str):
+                    # Try to convert string to int or float if it's a number
+                    try:
+                        if '.' in obj:
+                            return float(obj)
+                        return int(obj)
+                    except (ValueError, TypeError):
+                        return obj
+                return obj
+            
+            # Process the data to convert numeric strings
+            processed_data = convert_numbers(data)
+            
+            # Write to temporary file with custom formatting
+            json_str = json.dumps(
+                processed_data,
+                indent=2,
+                ensure_ascii=False,
+                cls=CustomJSONEncoder
             )
+            
+            # Write the formatted JSON to the temp file
+            temp_path.write_text(json_str, encoding="utf-8")
             
             # On Windows, we need to handle the case where the destination exists
             if file_path.exists():
@@ -330,19 +362,36 @@ def export_device_json(
         abs_row: Optional[AxsOlAbstractionRow] = None
 
         if axsol_long:
-            prefix = axsol_long.split()[0].strip()
-            row_map = abstractions.get(prefix, {})
-            for key in _axsol_lookup_keys(axsol_long):
-                abs_row = row_map.get(key)
+            # The axsol_long from device CSV is actually the short name in the generic CSV
+            # We need to find the matching abstraction by short name
+            abs_row = None
+            
+            # Search through all abstractions to find one with matching short_name
+            for prefix, row_map in abstractions.items():
+                for row in row_map.values():
+                    if row.short_name and row.short_name.strip() == axsol_long.strip():
+                        abs_row = row
+                        break
                 if abs_row:
                     break
+                    
             if abs_row:
-                mqtt_name = abs_row.short_name or ""
+                # Debug output
+                console.print(f"[dim]Found matching abstraction for short name: {axsol_long}")
+                console.print(f"[dim]  Found short name: {abs_row.short_name}")
+                console.print(f"[dim]  Found long name: {abs_row.long_name}")
+                
+                # Use the device's AXSOL Name as MQTT name
+                mqtt_name = axsol_long
+                # Use the long name from the abstraction as the description
                 description = abs_row.long_name or ""
                 ax_unit = abs_row.unit
                 ax_scaling = abs_row.scaling
                 ax_lim_down = abs_row.limit_down
                 ax_lim_up = abs_row.limit_up
+                
+                console.print(f"[dim]  Set mqtt_name to: {mqtt_name}")
+                console.print(f"[dim]  Set description to: {description}")
 
         out_unit = unit
         out_scaling = scaling
@@ -375,6 +424,9 @@ def export_device_json(
             if ax_scaling:
                 out_scaling = ax_scaling
 
+        # Ensure mqttName is set correctly - use the short name from the abstraction if available
+        final_mqtt_name = mqtt_name if mqtt_name else ""
+        
         payload = {
             "mbRegister": reg or "",
             "unit": out_unit or "",
@@ -383,7 +435,7 @@ def export_device_json(
             "upperLimit": upper_limit or "",
             "lowerLimit": lower_limit or "",
             "description": description or axsol_long or "",
-            "mqttName": mqtt_name or "",
+            "mqttName": final_mqtt_name,
             "type": dtype or "",
             "nativeName": topic or "",
         }
