@@ -1,104 +1,68 @@
 # AXOS Variable Configurator
 
-A powerful tool for managing and exporting device configurations in the AXSOL ecosystem. This project provides both a command-line interface and a Streamlit-based web interface for working with device variable configurations.
+Scripts in this repo:
+- `process_csv.py`: transforms an input PLC CSV into `processed_variables.csv`, `configs/*.json`, and `mb_handler_summary.txt`.
+- `validate_outputs.py`: validates generated `run_output_*` folders.
 
-## Features
+## Prerequisites
 
-- **CSV to JSON Conversion**: Convert device configuration CSVs to standardized JSON format
-- **AXSOL Integration**: Map device-specific parameters to AXSOL's standardized format
-- **Unit Variable Expansion**: Automatically expand unit variables with configurable multipliers and address offsets
-- **Streamlit UI**: User-friendly web interface for browsing and editing configurations
-- **Batch Processing**: Process multiple device configurations in one go
-- **Safe File Operations**: Atomic writes and backup functionality to prevent data loss
+- Python `3.10+`
+- `pip`
 
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/axos-var-configurator.git
-   cd axos-var-configurator
-   ```
-
-2. Create and activate a virtual environment (recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-
-### Command Line Interface
+## Setup
 
 ```bash
-# Export device configuration to JSON
-python -m axos_var_configurator.cli export /path/to/device.csv --output /output/directory
-
-# Export in AXSOL format
-python -m axos_var_configurator.cli export /path/to/device.csv --format axsol --output /output/directory
-
-# Batch export all devices from a directory
-python -m axos_var_configurator.cli batch-export /path/to/devices/ --output /output/directory
+python -m venv .venv
+. .venv/Scripts/activate
+pip install -r dev-requirements.txt
 ```
 
-### Web Interface
+## Run
 
 ```bash
-# Start the Streamlit web interface
-streamlit run streamlit_app.py
+python process_csv.py --input path/to/input.csv --outdir run_output_001
 ```
 
-Then open your browser to `http://localhost:8501`
+Arguments:
+- `--input, -i`: required path to input CSV.
+- `--outdir, -o`: output directory (defaults to repository root).
+- `--no-save-processed`: skip writing `processed_variables.csv`.
 
-## Features in Detail
+## Validate Generated Outputs
 
-### Unit Variable Expansion
-
-The configurator supports automatic expansion of unit variables with patterns like `U#_` or `U_#` in MQTT names. For example:
-
-- `U#_MEAS_VOLTAGE` with multiplier 3 becomes:
-  - `U1_MEAS_VOLTAGE`
-  - `U2_MEAS_VOLTAGE`
-  - `U3_MEAS_VOLTAGE`
-
-### Safe File Operations
-
-- Atomic writes to prevent partial file corruption
-- Automatic backups before overwriting files
-- Confirmation prompts for destructive operations
-
-## Project Structure
-
-```
-axos_var_configurator/
-├── __init__.py
-├── cli.py           # Command-line interface
-├── csvio.py         # CSV I/O operations
-├── exporter.py      # JSON export logic
-├── units.py         # Unit conversion utilities
-└── baseline.py      # Configuration versioning
+```bash
+python validate_outputs.py --base-dir . --max-mbhandler 30
 ```
 
-## Dependencies
+## Maintain The Repository
 
-- Python 3.8+
-- typer
-- rich
-- streamlit
-- pandas
+Quality checks:
 
-## License
+```bash
+ruff check .
+ruff format --check .
+pytest -q
+```
 
-This project is proprietary software. All rights reserved.
+Enable local pre-commit hooks:
 
-## Contributing
+```bash
+pre-commit install
+pre-commit run --all-files
+```
 
-For internal contributions only. Please contact the maintainers for access.
+CI:
+- GitHub Actions runs linting and tests on every push and pull request via `.github/workflows/ci.yml`.
 
-## Support
+## Input Expectations
 
-For support, please contact the development team at [your-email@example.com](mailto:your-email@example.com).
+- Delimiter is auto-detected: tab, semicolon, or comma.
+- At minimum, include `plcVariableName` and `mbRegister`.
+- Optional columns include `multiplier`, `addressOffset`, `mbType`, `mbFunctionCode`, `mbUsed`, etc.
+- Rows with `multiplier > 1` are expanded for internal handler calculations only (variable names are not expanded).
+
+## Output Details
+
+- `processed_variables.csv`: semicolon-separated with computed columns (`mbTypeSize`, `mbHandler`, `mbHandlerOffset`, `mbIdx`).
+- `configs/`: one JSON file per `plcVariableName`.
+- `mb_handler_summary.txt`: handler start/length overview.

@@ -1,9 +1,25 @@
-.idea/
+# Python cache and bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+
+# Virtual environments
 .venv/
 venv/
-out/
-out_all/
-.streamlit/
-ui_backups/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# IDE files
+.idea/
+.vscode/
+
+# Generated project outputs
+configs/
+processed_variables.csv
+mb_handler_summary.txt
+run_output_*/
+
