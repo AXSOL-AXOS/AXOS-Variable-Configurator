@@ -12,6 +12,9 @@ env/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tmp/
+.pip-cache/
+.pip-tmp/
 
 # IDE files
 .idea/
@@ -22,4 +25,3 @@ configs/
 processed_variables.csv
 mb_handler_summary.txt
 run_output_*/
-

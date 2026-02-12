@@ -44,15 +44,15 @@ def infer_type_size(t):
     - integer number of bits (16, 32, 64, ...). Defaults to 16 when unknown.
     """
     if pd.isna(t):
-        return 16
+        return 32
     s = str(t).strip().upper()
     type_map = {
         "UINT16": 16,
         "INT16": 16,
+        "UINT": 16,
         "UINT32": 32,
         "INT32": 32,
         "FLOAT": 32,
-        "DOUBLE": 64,
     }
     if s in type_map:
         return type_map[s]
@@ -61,7 +61,7 @@ def infer_type_size(t):
     if m:
         return int(m.group(1))
     # Fallback default
-    return 16
+    return 32
 
 
 def expand_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -203,6 +203,11 @@ def sanitize_filename(name: str) -> str:
     """
     # remove problematic characters
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", name)
+
+
+def normalize_mqtt_name(value: str) -> str:
+    """Normalize mqttName by stripping and collapsing internal whitespace."""
+    return " ".join(str(value).split())
 
 
 def process(input_csv: str, outdir: str, save_processed: bool = True) -> pd.DataFrame:
@@ -365,6 +370,9 @@ def process(input_csv: str, outdir: str, save_processed: bool = True) -> pd.Data
                 if isinstance(val, (int, float)):
                     record[col] = bool(int(val))
                     continue
+            if col == "mqttName":
+                record[col] = normalize_mqtt_name(val)
+                continue
             # Coerce selected fields to float, all other numbers to int
             if isinstance(val, (int, float)):
                 if col in float_fields:
