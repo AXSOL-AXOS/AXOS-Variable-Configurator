@@ -137,7 +137,7 @@ def assign_mb_handler(df: pd.DataFrame) -> pd.DataFrame:
         if (
             current_function is not None
             and func == current_function
-            and current_count < 124
+            and current_count + size // 16 < 124
             and last_address is not None
         ):
             # expected next address depends on last variable size
@@ -151,7 +151,7 @@ def assign_mb_handler(df: pd.DataFrame) -> pd.DataFrame:
             current_count = 0
             current_function = func
 
-        current_count += 1
+        current_count += size // 16
         df.at[idx, "mbHandler"] = int(current_handler)
         last_address = addr
         last_size = size
