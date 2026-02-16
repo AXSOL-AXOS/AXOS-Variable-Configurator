@@ -210,6 +210,23 @@ def normalize_mqtt_name(value: str) -> str:
     return " ".join(str(value).split())
 
 
+def validate_created_configs_count(df: pd.DataFrame, configs_dir: str) -> None:
+    """Validate created config-file count against processed CSV row count.
+
+    Raises ValueError when the number of generated JSON files does not match
+    the number of processed rows, which typically indicates duplicate
+    `plcVariableName` values causing filename collisions/overwrites.
+    """
+    expected = len(df.index)
+    created = len([name for name in os.listdir(configs_dir) if name.lower().endswith(".json")])
+    if created != expected:
+        raise ValueError(
+            "Config generation mismatch: expected "
+            f"{expected} JSON files (one per CSV row), but found {created} in '{configs_dir}'. "
+            "This usually means duplicated plcVariableName entries that overwrite files."
+        )
+
+
 def process(input_csv: str, outdir: str, save_processed: bool = True) -> pd.DataFrame:
     """Process the input CSV and generate outputs.
 
@@ -384,6 +401,8 @@ def process(input_csv: str, outdir: str, save_processed: bool = True) -> pd.Data
 
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(record, fh, indent=2, ensure_ascii=False)
+
+    validate_created_configs_count(df, configs_dir)
 
     return df
 
